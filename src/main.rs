@@ -52,18 +52,21 @@ use crossterm::{
     execute,
     style::{Color, Print, ResetColor, SetForegroundColor},
 };
+use clap::{Arg, Command};
 
 mod ai;
 mod optimized_game;
 mod ai_helpers;
 mod display;
 mod stats;
+mod elo;
 
 use optimized_game::{FastGameState, FastPlayer};
 use ai::HybridAI;
 use ai_helpers::{choose_random_move_fast, choose_smart_move_fast};
 use display::{clear_screen, display_board, print_piece_positions, print_score, global_to_coord, show_winner};
 use stats::run_statistics_menu;
+use elo::{EloDatabase, get_k_factor};
 
 #[derive(Debug, Clone, Copy)]
 enum AIType {
@@ -75,6 +78,50 @@ enum AIType {
 
 
 fn main() {
+    // Parse command line arguments
+    let matches = Command::new("Royal Game of Ur")
+        .version("1.0")
+        .about("Play the ancient Royal Game of Ur with ELO rating system")
+        .arg(
+            Arg::new("elo-file")
+                .long("elo-file")
+                .short('e')
+                .value_name("FILE")
+                .help("Path to ELO ratings JSON file")
+                .action(clap::ArgAction::Set)
+        )
+        .arg(
+            Arg::new("leaderboard")
+                .long("leaderboard")
+                .short('l')
+                .help("Show ELO leaderboard and exit")
+                .action(clap::ArgAction::SetTrue)
+        )
+        .get_matches();
+
+    // Determine ELO file path
+    let elo_file_path = matches.get_one::<String>("elo-file")
+        .map(|s| s.clone())
+        .unwrap_or_else(|| "ur_ratings.json".to_string());
+
+    // Load or create ELO database
+    let mut elo_db = match EloDatabase::load_from_file(&elo_file_path) {
+        Ok(db) => {
+            println!("✅ Loaded ELO ratings from: {}", elo_file_path);
+            db
+        }
+        Err(_) => {
+            println!("📊 Creating new ELO database: {}", elo_file_path);
+            EloDatabase::new()
+        }
+    };
+
+    // Handle leaderboard mode
+    if matches.get_flag("leaderboard") {
+        elo_db.print_leaderboard();
+        return;
+    }
+
     println!("=== Royal Game of Ur (Optimized Edition) ===\n");
     println!("Rules Summary:");
     println!("- Two players (Player 1 = top row, Player 2 = bottom row).");
@@ -94,7 +141,9 @@ fn main() {
     println!("  5: Play against MCTS AI (you are Player 1)");
     println!("  6: Watch MCTS AI vs Smart AI");
     println!("  7: Watch two MCTS AI bots play against each other");
-    print!("Enter choice [0-7]: ");
+    println!("  8: Watch random AI vs MCTS AI");
+    println!("  9: Show ELO leaderboard");
+    print!("Enter choice [0-9]: ");
     io::stdout().flush().unwrap();
 
     let mut buf = String::new();
@@ -103,9 +152,14 @@ fn main() {
 
     println!();
 
-    // Handle statistics mode separately
+    // Handle special modes
     if choice == 4 {
         run_statistics_menu();
+        return;
+    }
+
+    if choice == 9 {
+        elo_db.print_leaderboard();
         return;
     }
 
@@ -113,7 +167,7 @@ fn main() {
     let num_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     println!("System has {} logical cores available", num_cpus);
 
-    let use_threads = if choice == 0 || choice == 5 || choice == 6 || choice == 7 {
+    let use_threads = if choice == 0 || choice == 5 || choice == 6 || choice == 7 || choice == 8 {
         // For AI vs AI or human vs MCTS, ask about threading
         print!("Use multithreaded MCTS? [Y/n]: ");
         io::stdout().flush().unwrap();
@@ -142,6 +196,7 @@ fn main() {
         5 => (AIType::Human, AIType::MCTS),       // Human vs MCTS AI
         6 => (AIType::MCTS, AIType::Smart),       // MCTS AI vs Smart AI
         7 => (AIType::MCTS, AIType::MCTS),        // Two MCTS AIs
+        8 => (AIType::Random, AIType::MCTS),      // Random AI vs MCTS AI
         _ => (AIType::Human, AIType::Smart),      // Default: Human vs Smart AI
     };
 
@@ -162,6 +217,46 @@ fn main() {
         println!();
     }
 
+    // Get player names for human players and ELO tracking
+    let player1_name = match player1_type {
+        AIType::Human => {
+            print!("Enter name for Player 1: ");
+            io::stdout().flush().unwrap();
+            let mut name = String::new();
+            io::stdin().read_line(&mut name).unwrap();
+            let name = name.trim().to_string();
+            if name.is_empty() { "Player 1".to_string() } else { name }
+        }
+        AIType::Random => "Random AI #1".to_string(),
+        AIType::Smart => "Smart AI #1".to_string(),
+        AIType::MCTS => "MCTS AI #1".to_string(),
+    };
+
+    let player2_name = match player2_type {
+        AIType::Human => {
+            print!("Enter name for Player 2: ");
+            io::stdout().flush().unwrap();
+            let mut name = String::new();
+            io::stdin().read_line(&mut name).unwrap();
+            let name = name.trim().to_string();
+            if name.is_empty() { "Player 2".to_string() } else { name }
+        }
+        AIType::Random => if player1_name == "Random AI #1" { "Random AI #2".to_string() } else { "Random AI #1".to_string() },
+        AIType::Smart => if player1_name == "Smart AI #1" { "Smart AI #2".to_string() } else { "Smart AI #1".to_string() },
+        AIType::MCTS => if player1_name == "MCTS AI #1" { "MCTS AI #2".to_string() } else { "MCTS AI #1".to_string() },
+    };
+
+    // Show current ratings for all players
+    println!("Current ELO Ratings:");
+    let rating1 = elo_db.get_or_create_player(&player1_name);
+    println!("Player 1 - {} : ELO {:.0} (Games: {}, W: {}, L: {})",
+             player1_name, rating1.rating, rating1.games_played, rating1.wins, rating1.losses);
+
+    let rating2 = elo_db.get_or_create_player(&player2_name);
+    println!("Player 2 - {} : ELO {:.0} (Games: {}, W: {}, L: {})",
+             player2_name, rating2.rating, rating2.games_played, rating2.wins, rating2.losses);
+    println!();
+
     let mut game = FastGameState::new();
 
     loop {
@@ -176,6 +271,58 @@ fn main() {
 
         if let Some(winner_player) = winner {
             show_winner(winner_player, &game);
+
+            // Update ELO ratings if human players are involved
+            let (winner_name, loser_name) = match winner_player {
+                FastPlayer::One => (&player1_name, &player2_name),
+                FastPlayer::Two => (&player2_name, &player1_name),
+            };
+
+            let winner_is_human = match winner_player {
+                FastPlayer::One => matches!(player1_type, AIType::Human),
+                FastPlayer::Two => matches!(player2_type, AIType::Human),
+            };
+
+            let loser_is_human = match winner_player {
+                FastPlayer::One => matches!(player2_type, AIType::Human),
+                FastPlayer::Two => matches!(player1_type, AIType::Human),
+            };
+
+            // Always update ELO ratings for all players (humans and AIs)
+            // Get K-factor - use higher K-factor for newer players
+            let winner_games = elo_db.get_or_create_player(winner_name).games_played;
+            let loser_games = elo_db.get_or_create_player(loser_name).games_played;
+            let k_factor = get_k_factor(winner_games.max(loser_games));
+
+            // Store previous ratings for display
+            let winner_old_rating = elo_db.get_or_create_player(winner_name).rating;
+            let loser_old_rating = elo_db.get_or_create_player(loser_name).rating;
+
+            // Update ratings
+            elo_db.update_ratings(winner_name, loser_name, k_factor);
+
+            // Display rating changes
+            println!("\n📊 ELO Rating Changes:");
+
+            let winner_rating = elo_db.get_or_create_player(winner_name);
+            let winner_change = winner_rating.rating - winner_old_rating;
+            let winner_icon = if winner_is_human { "🏆" } else { "🤖" };
+            println!("{} {} : {:.0} → {:.0} ({:+.0})",
+                    winner_icon, winner_name, winner_old_rating, winner_rating.rating, winner_change);
+
+            let loser_rating = elo_db.get_or_create_player(loser_name);
+            let loser_change = loser_rating.rating - loser_old_rating;
+            let loser_icon = if loser_is_human { "😞" } else { "🤖" };
+            println!("{} {} : {:.0} → {:.0} ({:+.0})",
+                    loser_icon, loser_name, loser_old_rating, loser_rating.rating, loser_change);
+
+            // Save updated ratings
+            if let Err(e) = elo_db.save_to_file(&elo_file_path) {
+                println!("⚠️  Warning: Could not save ELO ratings: {}", e);
+            } else {
+                println!("💾 ELO ratings saved to {}", elo_file_path);
+            }
+
             break;
         }
 
