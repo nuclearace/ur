@@ -242,3 +242,170 @@ pub fn show_winner(winner: FastPlayer, game: &FastGameState) {
     println!("║                                       ║");
     println!("╚═══════════════════════════════════════╝");
 }
+
+/// Display AI search progress in a formatted way
+pub fn display_search_progress(ai_name: &str, nodes: u64, time_ms: u64, nps: u64, depth: u32) {
+    let _ = execute!(
+        io::stdout(),
+        SetForegroundColor(Color::Cyan),
+        Print("🔍 "),
+        SetForegroundColor(Color::White),
+        Print(format!("{} ", ai_name)),
+        SetForegroundColor(Color::DarkGrey),
+        Print("│ "),
+        SetForegroundColor(Color::Yellow),
+        Print(format!("depth {}", depth)),
+        SetForegroundColor(Color::DarkGrey),
+        Print(" │ "),
+        SetForegroundColor(Color::Green),
+        Print(format!("{} nodes", format_number(nodes))),
+        SetForegroundColor(Color::DarkGrey),
+        Print(" │ "),
+        SetForegroundColor(Color::Magenta),
+        Print(format!("{}ms", time_ms)),
+        SetForegroundColor(Color::DarkGrey),
+        Print(" │ "),
+        SetForegroundColor(Color::Cyan),
+        Print(format!("{} nps", format_number(nps))),
+        ResetColor
+    );
+    println!();
+}
+
+/// Display AI search completion summary
+pub fn display_search_complete(ai_name: &str, nodes: u64, time_ms: u64, nps: u64, depth: u32, best_move: Option<u8>, best_score: Option<f64>) {
+    println!("┌─────────────────────────────────────┐");
+    print!("│ ");
+    let _ = execute!(
+        io::stdout(),
+        SetForegroundColor(Color::Green),
+        Print("✅ "),
+        SetForegroundColor(Color::White),
+        Print(format!("{} Search Complete", ai_name)),
+        ResetColor
+    );
+    println!("       │");
+    println!("├─────────────────────────────────────┤");
+
+    print!("│ ");
+    let _ = execute!(
+        io::stdout(),
+        SetForegroundColor(Color::Yellow),
+        Print("📊 Depth: "),
+        SetForegroundColor(Color::White),
+        Print(format!("{}", depth)),
+        ResetColor
+    );
+    println!("                        │");
+
+    print!("│ ");
+    let _ = execute!(
+        io::stdout(),
+        SetForegroundColor(Color::Green),
+        Print("🔢 Nodes: "),
+        SetForegroundColor(Color::White),
+        Print(format!("{}", format_number(nodes))),
+        ResetColor
+    );
+    let padding = 24 - format_number(nodes).len();
+    for _ in 0..padding { print!(" "); }
+    println!("│");
+
+    print!("│ ");
+    let _ = execute!(
+        io::stdout(),
+        SetForegroundColor(Color::Magenta),
+        Print("⏱️  Time: "),
+        SetForegroundColor(Color::White),
+        Print(format!("{}ms", time_ms)),
+        ResetColor
+    );
+    let time_str = format!("{}ms", time_ms);
+    let padding = 25 - time_str.len();
+    for _ in 0..padding { print!(" "); }
+    println!("│");
+
+    print!("│ ");
+    let _ = execute!(
+        io::stdout(),
+        SetForegroundColor(Color::Cyan),
+        Print("⚡ Speed: "),
+        SetForegroundColor(Color::White),
+        Print(format!("{} nps", format_number(nps))),
+        ResetColor
+    );
+    let nps_str = format!("{} nps", format_number(nps));
+    let padding = 24 - nps_str.len();
+    for _ in 0..padding { print!(" "); }
+    println!("│");
+
+    if let (Some(mv), Some(score)) = (best_move, best_score) {
+        print!("│ ");
+        let _ = execute!(
+            io::stdout(),
+            SetForegroundColor(Color::Blue),
+            Print("🎯 Best: "),
+            SetForegroundColor(Color::White),
+            Print(format!("piece {} (score: {:.2})", mv, score)),
+            ResetColor
+        );
+        let best_str = format!("piece {} (score: {:.2})", mv, score);
+        let padding = 25 - best_str.len();
+        for _ in 0..padding { print!(" "); }
+        println!("│");
+    }
+
+    println!("└─────────────────────────────────────┘");
+}
+
+/// Display AI search header when search starts
+pub fn display_search_header(ai_name: &str, player: FastPlayer, roll: u8, moves: &[u8]) {
+    let (player_color, player_symbol) = match player {
+        FastPlayer::One => (Color::Blue, "🔵"),
+        FastPlayer::Two => (Color::Red, "🔴"),
+    };
+
+    println!("┌─────────────────────────────────────┐");
+    print!("│ ");
+    let _ = execute!(
+        io::stdout(),
+        SetForegroundColor(Color::White),
+        Print(format!("🤖 {} Analyzing", ai_name)),
+        ResetColor
+    );
+    let padding = 21 - ai_name.len();
+    for _ in 0..padding { print!(" "); }
+    println!("│");
+
+    print!("│ ");
+    let _ = execute!(
+        io::stdout(),
+        SetForegroundColor(player_color),
+        Print(format!("{} {} ", player_symbol, player.name())),
+        SetForegroundColor(Color::DarkGrey),
+        Print("│ "),
+        SetForegroundColor(Color::Yellow),
+        Print(format!("roll {} ", roll)),
+        SetForegroundColor(Color::DarkGrey),
+        Print("│ "),
+        SetForegroundColor(Color::Green),
+        Print(format!("{} moves", moves.len())),
+        ResetColor
+    );
+    let content_len = player.name().len() + 15; // Approximate content length
+    let padding = 35 - content_len;
+    for _ in 0..padding { print!(" "); }
+    println!("│");
+    println!("└─────────────────────────────────────┘");
+}
+
+/// Format large numbers with K/M suffixes for readability
+fn format_number(num: u64) -> String {
+    if num >= 1_000_000 {
+        format!("{:.1}M", num as f64 / 1_000_000.0)
+    } else if num >= 1_000 {
+        format!("{:.1}K", num as f64 / 1_000.0)
+    } else {
+        num.to_string()
+    }
+}

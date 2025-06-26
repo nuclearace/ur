@@ -7,17 +7,20 @@
 /// 5. SIMD-friendly operations where possible
 
 use std::fmt;
+use crate::zobrist;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FastGameState {
     /// Bitboard for both players: bits 0-19 = Player 1, bits 20-39 = Player 2
     pub occupied_squares: u64,
-    /// Packed piece positions: 4 bits per piece, 7 pieces per player = 56 bits total
+    /// Packed representation (fits in 128 bits total)
     /// Lower 28 bits = Player 1, upper 28 bits = Player 2
     /// Each 4-bit value: 0=OffBoard, 1-14=OnBoard(0-13), 15=Finished
     pub piece_positions: u64,
     /// Packed scores and turn: bits 0-2=P1 score, bits 3-5=P2 score, bit 6=turn
     pub scores_and_turn: u8,
+    /// Zobrist hash for the current game state
+    pub hash: u64,
 }
 
 /// Move representation that can be undone
@@ -53,8 +56,6 @@ impl FastPlayer {
     }
 }
 
-
-
 impl FastGameState {
     const PATHS: [[u8; 14]; 2] = [
         [3, 2, 1, 0, 6, 7, 8, 9, 10, 11, 12, 13, 5, 4],      // Player 1
@@ -65,19 +66,23 @@ impl FastGameState {
     const ROSETTES: u32 = (1 << 4) | (1 << 9) | (1 << 18);
 
     /// Safe squares (cannot be captured)
-    const SAFE_SQUARES: u32 = (1 << 0) | (1 << 4) | (1 << 9) | (1 << 14) | (1 << 18);
+    /// Player 1 private: 0,1,2,3,4,5  Player 2 private: 14,15,16,17,18,19  All rosettes: 4,9,18
+    const SAFE_SQUARES: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) |  // Player 1 private
+                              (1 << 14) | (1 << 15) | (1 << 16) | (1 << 17) | (1 << 18) | (1 << 19) | // Player 2 private
+                              (1 << 9); // Middle rosette (others already covered in private areas)
 
     pub fn new() -> Self {
         FastGameState {
             occupied_squares: 0,
             piece_positions: 0,
             scores_and_turn: 0,
+            hash: zobrist::initial_hash(),
         }
     }
 
     /// Get current player
     #[inline]
-    pub fn current_player(self) -> FastPlayer {
+    pub fn current_player(&self) -> FastPlayer {
         if (self.scores_and_turn >> 6) & 1 == 0 {
             FastPlayer::One
         } else {
@@ -126,6 +131,17 @@ impl FastGameState {
         };
         let mask = !(0xF << shift);
         self.piece_positions = (self.piece_positions & mask) | ((pos as u64 & 0xF) << shift);
+    }
+
+    #[inline]
+    fn toggle_piece_hash(&mut self, player: FastPlayer, piece_idx: u8, pos: u8) {
+        let player_idx = player as usize;
+        self.hash ^= zobrist::ZOBRIST_TABLE.piece_keys[player_idx][piece_idx as usize][pos as usize];
+    }
+
+    #[inline]
+    fn toggle_turn_hash(&mut self) {
+        self.hash ^= zobrist::ZOBRIST_TABLE.turn_key;
     }
 
     /// Path to global square conversion
@@ -183,8 +199,8 @@ impl FastGameState {
         if to_pos >= 1 && to_pos <= 14 {
             let target_square = Self::path_to_global(player, to_pos - 1);
             match self.get_occupant(target_square) {
-                Some(occupant) if occupant == player => return None,
-                Some(_) if Self::is_safe(target_square) => return None,
+                Some(occupant) if occupant == player => return None, // Can't capture own piece
+                Some(_) if Self::is_safe(target_square) => return None, // Can't capture a safe square
                 Some(_) => {
                     // Capture
                     for i in 0..7 {
@@ -226,6 +242,9 @@ impl FastGameState {
             FastPlayer::Two => 20,
         };
 
+        // Update hash for piece moving from its old position
+        self.toggle_piece_hash(player, move_info.piece_idx, move_info.from_pos);
+
         // Remove from old position
         if move_info.from_pos >= 1 && move_info.from_pos <= 14 {
             let old_square = Self::path_to_global(player, move_info.from_pos - 1);
@@ -242,12 +261,19 @@ impl FastGameState {
             let cap_pos = self.get_piece_pos(opp_player, cap_piece);
             let cap_square = Self::path_to_global(opp_player, cap_pos - 1);
 
+            // Update hash for captured piece
+            self.toggle_piece_hash(opp_player, cap_piece, cap_pos);
+            self.toggle_piece_hash(opp_player, cap_piece, 0); // Moving to off-board
+
             self.occupied_squares &= !(1u64 << (cap_square + opp_offset));
             self.set_piece_pos(opp_player, cap_piece, 0);
         }
 
         // Set new position
         self.set_piece_pos(player, move_info.piece_idx, move_info.to_pos);
+
+        // Update hash for piece moving to its new position
+        self.toggle_piece_hash(player, move_info.piece_idx, move_info.to_pos);
 
         if move_info.to_pos >= 1 && move_info.to_pos <= 14 {
             let new_square = Self::path_to_global(player, move_info.to_pos - 1);
@@ -261,17 +287,30 @@ impl FastGameState {
         // Update turn if no extra turn
         if !move_info.extra_turn {
             self.scores_and_turn ^= 1 << 6;
+            self.toggle_turn_hash();
         }
     }
 
     /// Unmake a move (restore previous state)
     pub fn unmake_move(&mut self, player: FastPlayer, move_info: &MoveInfo) {
+        // The order of operations is the reverse of apply_move_internal,
+        // and hash toggling must be paired with state changes.
+
+        // Restore turn first, if it was changed.
+        if !move_info.extra_turn {
+            self.toggle_turn_hash();
+            self.scores_and_turn ^= 1 << 6;
+        }
+
         let player_offset = match player {
             FastPlayer::One => 0,
             FastPlayer::Two => 20,
         };
 
-        // Remove from current position
+        // --- Undo the primary piece move ---
+
+        // 1. Remove piece from its destination
+        self.toggle_piece_hash(player, move_info.piece_idx, move_info.to_pos);
         if move_info.to_pos >= 1 && move_info.to_pos <= 14 {
             let square = Self::path_to_global(player, move_info.to_pos - 1);
             self.occupied_squares &= !(1u64 << (square + player_offset));
@@ -281,14 +320,15 @@ impl FastGameState {
             self.set_score(player, current_score - 1);
         }
 
-        // Restore to old position
+        // 2. Restore piece to its original position
         self.set_piece_pos(player, move_info.piece_idx, move_info.from_pos);
+        self.toggle_piece_hash(player, move_info.piece_idx, move_info.from_pos);
         if move_info.from_pos >= 1 && move_info.from_pos <= 14 {
             let old_square = Self::path_to_global(player, move_info.from_pos - 1);
             self.occupied_squares |= 1u64 << (old_square + player_offset);
         }
 
-        // Restore captured piece
+        // --- Restore a captured piece, if any ---
         if let Some(cap_piece) = move_info.captured_piece {
             let opp_player = player.opposite();
             let opp_offset = match opp_player {
@@ -296,17 +336,17 @@ impl FastGameState {
                 FastPlayer::Two => 20,
             };
 
-            // Find where it was captured
+            // We know where it was captured: the destination square of the move.
             let cap_square = Self::path_to_global(player, move_info.to_pos - 1);
             let cap_path_pos = Self::global_to_path(opp_player, cap_square) + 1;
 
+            // 1. Untoggle hash from off-board (0) to its original position
+            self.toggle_piece_hash(opp_player, cap_piece, 0);
+            self.toggle_piece_hash(opp_player, cap_piece, cap_path_pos);
+
+            // 2. Restore piece's state
             self.set_piece_pos(opp_player, cap_piece, cap_path_pos);
             self.occupied_squares |= 1u64 << (cap_square + opp_offset);
-        }
-
-        // Restore turn
-        if !move_info.extra_turn {
-            self.scores_and_turn ^= 1 << 6;
         }
     }
 

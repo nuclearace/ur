@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 use std::f64::consts::SQRT_2;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
+use std::time::Instant;
 use crate::optimized_game::{FastGameState, FastPlayer};
+use crate::display::{display_search_progress, display_search_complete};
 
 /// Optimized MCTS implementation using FastGameState with make/unmake moves
 pub struct MCTSAI {
@@ -14,6 +17,10 @@ pub struct MCTSAI {
     pub max_simulation_depth: usize,
     /// Number of threads to use for parallel simulation
     pub num_threads: usize,
+    /// Enable search progress reporting
+    pub enable_reporting: bool,
+    /// Report frequency (report every N simulations)
+    pub report_frequency: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -40,7 +47,15 @@ impl MCTSAI {
             exploration_constant,
             max_simulation_depth: 200,
             num_threads: num_threads.max(1),
+            enable_reporting: false,
+            report_frequency: 1000,
         }
+    }
+
+    /// Enable or disable search progress reporting
+    pub fn set_reporting(&mut self, enabled: bool, frequency: usize) {
+        self.enable_reporting = enabled;
+        self.report_frequency = frequency.max(100); // Minimum frequency to avoid spam
     }
 
     /// Choose the best move using optimized MCTS with make/unmake moves
@@ -60,12 +75,20 @@ impl MCTSAI {
             return Some(moves[0]);
         }
 
+        let start_time = Instant::now();
+
         // Use multithreading for complex decisions
         let best_piece_idx = if self.num_threads > 1 && self.simulations >= self.num_threads * 10 {
-            self.choose_move_parallel(game_state, player, roll, &moves)
+            self.choose_move_parallel(game_state, player, roll, &moves, start_time)
         } else {
-            self.choose_move_sequential(game_state, player, roll, &moves)
+            self.choose_move_sequential(game_state, player, roll, &moves, start_time)
         };
+
+        if self.enable_reporting {
+            let elapsed = start_time.elapsed().as_millis() as u64;
+            let nps = if elapsed > 0 { (self.simulations as u64 * 1000) / elapsed } else { 0 };
+            display_search_complete("MCTS", self.simulations as u64, elapsed, nps, self.max_simulation_depth as u32, Some(best_piece_idx), None);
+        }
 
         Some(best_piece_idx)
     }
@@ -76,12 +99,16 @@ impl MCTSAI {
         player: FastPlayer,
         roll: u8,
         moves: &[u8],
+        start_time: Instant,
     ) -> u8 {
         let simulations_per_thread = self.simulations / self.num_threads;
         let extra_simulations = self.simulations % self.num_threads;
 
         // Shared results that threads will write to
         let combined_stats = Arc::new(Mutex::new(HashMap::<u8, MoveStats>::new()));
+
+        // Progress tracking for reporting
+        let total_nodes = Arc::new(AtomicU64::new(0));
 
         // Initialize combined stats
         {
@@ -101,6 +128,7 @@ impl MCTSAI {
             let fast_state = Arc::clone(&fast_state);
             let moves = Arc::clone(&moves);
             let combined_stats = Arc::clone(&combined_stats);
+            let total_nodes = Arc::clone(&total_nodes);
 
             // Give some threads one extra simulation to handle remainder
             let thread_simulations = if thread_id < extra_simulations {
@@ -111,6 +139,9 @@ impl MCTSAI {
 
             let exploration_constant = self.exploration_constant;
             let max_depth = self.max_simulation_depth;
+            let enable_reporting = self.enable_reporting;
+            let report_frequency = self.report_frequency;
+            let num_threads_for_reporting = self.num_threads;
 
             let handle = thread::spawn(move || {
                 // Run MCTS simulations for this thread
@@ -119,7 +150,7 @@ impl MCTSAI {
                     local_stats.insert(piece_idx, MoveStats::new());
                 }
 
-                for _ in 0..thread_simulations {
+                for sim in 0..thread_simulations {
                     // Select move using UCB1
                     let selected_piece = Self::select_move_ucb1_static(&moves, &local_stats, exploration_constant);
 
@@ -130,6 +161,18 @@ impl MCTSAI {
                     let stats = local_stats.get_mut(&selected_piece).unwrap();
                     stats.visits += 1;
                     stats.wins += win_value;
+
+                                                                                // Update global node count and report progress if enabled
+                    if enable_reporting && thread_id == 0 { // Only main thread reports to avoid spam
+                        let current_nodes = total_nodes.fetch_add(num_threads_for_reporting as u64, Ordering::Relaxed) + num_threads_for_reporting as u64;
+                        if sim % (report_frequency / num_threads_for_reporting).max(1) == 0 {
+                            let elapsed = start_time.elapsed().as_millis() as u64;
+                            if elapsed > 0 {
+                                let nps = (current_nodes * 1000) / elapsed;
+                                display_search_progress("MCTS", current_nodes, elapsed, nps, max_depth as u32);
+                            }
+                        }
+                    }
                 }
 
                 // Merge local results into combined results
@@ -166,6 +209,7 @@ impl MCTSAI {
         player: FastPlayer,
         roll: u8,
         moves: &[u8],
+        start_time: Instant,
     ) -> u8 {
         // Initialize move statistics
         let mut move_stats: HashMap<u8, MoveStats> = HashMap::new();
@@ -174,7 +218,7 @@ impl MCTSAI {
         }
 
         // Run simulations
-        for _ in 0..self.simulations {
+        for sim in 0..self.simulations {
             // Select move using UCB1
             let selected_piece = self.select_move_ucb1(moves, &move_stats);
 
@@ -185,6 +229,15 @@ impl MCTSAI {
             let stats = move_stats.get_mut(&selected_piece).unwrap();
             stats.visits += 1;
             stats.wins += win_value;
+
+                        // Report progress if enabled
+            if self.enable_reporting && sim % self.report_frequency == 0 && sim > 0 {
+                let elapsed = start_time.elapsed().as_millis() as u64;
+                if elapsed > 0 {
+                    let nps = ((sim + 1) as u64 * 1000) / elapsed;
+                    display_search_progress("MCTS", (sim + 1) as u64, elapsed, nps, self.max_simulation_depth as u32);
+                }
+            }
         }
 
         // Select move with highest win rate
@@ -395,6 +448,8 @@ impl MCTSAI {
                 self.simulations,
                 self.simulations / self.num_threads)
     }
+
+
 }
 
 /// Enhanced AI that combines MCTS with the existing evaluation function
@@ -434,6 +489,11 @@ impl HybridAI {
             // Use simple depth-1 evaluation for simple decisions
             Some(MCTSAI::choose_smart_piece(game_state, player, &moves, roll))
         }
+    }
+
+    /// Enable or disable search progress reporting
+    pub fn set_reporting(&mut self, enabled: bool, frequency: usize) {
+        self.mcts.set_reporting(enabled, frequency);
     }
 
     /// Get information about the MCTS configuration

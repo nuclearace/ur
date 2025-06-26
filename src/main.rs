@@ -57,16 +57,21 @@ use clap::{Arg, Command};
 mod ai;
 mod optimized_game;
 mod ai_helpers;
+mod minimax;
 mod display;
 mod stats;
 mod elo;
+mod zobrist;
+mod tuner;
 
 use optimized_game::{FastGameState, FastPlayer};
-use ai::HybridAI;
-use ai_helpers::{choose_random_move_fast, choose_smart_move_fast};
-use display::{clear_screen, display_board, print_piece_positions, print_score, global_to_coord, show_winner};
-use stats::run_statistics_menu;
-use elo::{EloDatabase, get_k_factor};
+use crate::ai::HybridAI;
+use crate::ai_helpers::{choose_random_move_fast, choose_smart_move_fast};
+use crate::minimax::{choose_minimax_move_parallel_with_config, MinimaxConfig};
+use crate::display::{clear_screen, display_board, print_piece_positions, print_score, global_to_coord, show_winner, display_search_header};
+use crate::stats::run_statistics_menu;
+use crate::elo::{EloDatabase, get_k_factor};
+use crate::tuner::run_tuning_session;
 
 #[derive(Debug, Clone, Copy)]
 enum AIType {
@@ -74,6 +79,7 @@ enum AIType {
     Random,
     Smart,
     MCTS,
+    Minimax,
 }
 
 
@@ -97,12 +103,47 @@ fn main() {
                 .help("Show ELO leaderboard and exit")
                 .action(clap::ArgAction::SetTrue)
         )
+        .arg(
+            Arg::new("tune")
+                .long("tune")
+                .short('t')
+                .help("Run minimax parameter tuning and exit")
+                .action(clap::ArgAction::SetTrue)
+        )
+        .arg(
+            Arg::new("minimax-config")
+                .long("minimax-config")
+                .short('m')
+                .value_name("FILE")
+                .help("Path to minimax configuration JSON file")
+                .action(clap::ArgAction::Set)
+        )
+        .arg(
+            Arg::new("verbose")
+                .long("verbose")
+                .short('v')
+                .help("Enable AI search progress reporting")
+                .action(clap::ArgAction::SetTrue)
+        )
+        .arg(
+            Arg::new("report-frequency")
+                .long("report-frequency")
+                .value_name("NUMBER")
+                .help("Report frequency for AI search progress (default: 1000)")
+                .action(clap::ArgAction::Set)
+        )
         .get_matches();
 
     // Determine ELO file path
     let elo_file_path = matches.get_one::<String>("elo-file")
         .map(|s| s.clone())
         .unwrap_or_else(|| "ur_ratings.json".to_string());
+
+    // Get AI reporting configuration
+    let enable_ai_reporting = matches.get_flag("verbose");
+    let report_frequency: usize = matches.get_one::<String>("report-frequency")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000);
 
     // Load or create ELO database
     let mut elo_db = match EloDatabase::load_from_file(&elo_file_path) {
@@ -121,6 +162,30 @@ fn main() {
         elo_db.print_leaderboard();
         return;
     }
+
+    // Handle tuning mode
+    if matches.get_flag("tune") {
+        println!("🔧 Starting minimax parameter tuning...");
+        run_tuning_session();
+        return;
+    }
+
+    // Load minimax configuration if specified
+    let mut minimax_config = if let Some(config_path) = matches.get_one::<String>("minimax-config") {
+        match MinimaxConfig::load_from_file(config_path) {
+            Ok(config) => {
+                println!("✅ Loaded minimax configuration from: {}", config_path);
+                config
+            }
+            Err(e) => {
+                println!("⚠️  Warning: Could not load minimax config from {}: {}", config_path, e);
+                println!("Using default configuration instead.");
+                MinimaxConfig::default()
+            }
+        }
+    } else {
+        MinimaxConfig::default()
+    };
 
     println!("=== Royal Game of Ur (Optimized Edition) ===\n");
     println!("Rules Summary:");
@@ -143,7 +208,13 @@ fn main() {
     println!("  7: Watch two MCTS AI bots play against each other");
     println!("  8: Watch random AI vs MCTS AI");
     println!("  9: Show ELO leaderboard");
-    print!("Enter choice [0-9]: ");
+    println!("  10: Play against Minimax AI (you are Player 1)");
+    println!("  11: Watch Minimax AI vs Smart AI");
+    println!("  12: Watch Minimax AI vs MCTS AI");
+    println!("  13: Watch two Minimax AI bots play against each other");
+    println!("  14: Watch Random AI vs Minimax AI");
+    println!("  15: Tune Minimax parameters");
+    print!("Enter choice [0-15]: ");
     io::stdout().flush().unwrap();
 
     let mut buf = String::new();
@@ -160,6 +231,12 @@ fn main() {
 
     if choice == 9 {
         elo_db.print_leaderboard();
+        return;
+    }
+
+    if choice == 15 {
+        println!("🔧 Starting minimax parameter tuning...");
+        run_tuning_session();
         return;
     }
 
@@ -197,8 +274,18 @@ fn main() {
         6 => (AIType::MCTS, AIType::Smart),       // MCTS AI vs Smart AI
         7 => (AIType::MCTS, AIType::MCTS),        // Two MCTS AIs
         8 => (AIType::Random, AIType::MCTS),      // Random AI vs MCTS AI
+        10 => (AIType::Human, AIType::Minimax),   // Human vs Minimax AI
+        11 => (AIType::Minimax, AIType::Smart),   // Minimax AI vs Smart AI
+        12 => (AIType::Minimax, AIType::MCTS),    // Minimax AI vs MCTS AI
+        13 => (AIType::Minimax, AIType::Minimax), // Two Minimax AIs
+        14 => (AIType::Random, AIType::Minimax),  // Random AI vs Minimax AI
         _ => (AIType::Human, AIType::Smart),      // Default: Human vs Smart AI
     };
+
+    // Determine if we should enable AI reporting
+    // Enable if explicitly requested OR if it's an AI vs AI game
+    let both_ai = !matches!(player1_type, AIType::Human) && !matches!(player2_type, AIType::Human);
+    let should_enable_reporting = enable_ai_reporting || both_ai;
 
     // Create MCTS AI instances with explicit threading configuration
     let mcts_simulations = if use_threads {
@@ -209,7 +296,20 @@ fn main() {
         2000
     };
 
-    let mcts_ai = HybridAI::new_with_threads(mcts_simulations, num_threads);
+    let mut mcts_ai = HybridAI::new_with_threads(mcts_simulations, num_threads);
+
+    // Enable reporting if requested
+    if should_enable_reporting {
+        mcts_ai.set_reporting(true, report_frequency);
+        minimax_config.enable_reporting = true;
+
+        if enable_ai_reporting {
+            println!("🔍 AI search reporting enabled (frequency: {} nodes)", report_frequency);
+        } else if both_ai {
+            println!("🔍 AI search reporting auto-enabled for AI vs AI game");
+        }
+        println!("ℹ️  You'll see AI search progress with nodes/sec and depth information.");
+    }
 
     // Show AI configuration for MCTS players
     if matches!(player1_type, AIType::MCTS) || matches!(player2_type, AIType::MCTS) {
@@ -230,6 +330,7 @@ fn main() {
         AIType::Random => "Random AI #1".to_string(),
         AIType::Smart => "Smart AI #1".to_string(),
         AIType::MCTS => "MCTS AI #1".to_string(),
+        AIType::Minimax => "Minimax AI #1".to_string(),
     };
 
     let player2_name = match player2_type {
@@ -244,6 +345,7 @@ fn main() {
         AIType::Random => if player1_name == "Random AI #1" { "Random AI #2".to_string() } else { "Random AI #1".to_string() },
         AIType::Smart => if player1_name == "Smart AI #1" { "Smart AI #2".to_string() } else { "Smart AI #1".to_string() },
         AIType::MCTS => if player1_name == "MCTS AI #1" { "MCTS AI #2".to_string() } else { "MCTS AI #1".to_string() },
+        AIType::Minimax => if player1_name == "Minimax AI #1" { "Minimax AI #2".to_string() } else { "Minimax AI #1".to_string() },
     };
 
     // Show current ratings for all players
@@ -278,15 +380,8 @@ fn main() {
                 FastPlayer::Two => (&player2_name, &player1_name),
             };
 
-            let winner_is_human = match winner_player {
-                FastPlayer::One => matches!(player1_type, AIType::Human),
-                FastPlayer::Two => matches!(player2_type, AIType::Human),
-            };
-
-            let loser_is_human = match winner_player {
-                FastPlayer::One => matches!(player2_type, AIType::Human),
-                FastPlayer::Two => matches!(player1_type, AIType::Human),
-            };
+            let winner_is_human = matches!(player1_type, AIType::Human);
+            let loser_is_human = matches!(player2_type, AIType::Human);
 
             // Always update ELO ratings for all players (humans and AIs)
             // Get K-factor - use higher K-factor for newer players
@@ -368,6 +463,7 @@ fn main() {
                 AIType::Random => "🎲 Random AI",
                 AIType::Smart => "🧠 Smart AI",
                 AIType::MCTS => "🤖 MCTS AI",
+                AIType::Minimax => "🎯 Minimax AI",
                 AIType::Human => unreachable!(),
             };
             print!("🤔 {} is thinking", ai_type_name);
@@ -487,20 +583,30 @@ fn main() {
                 AIType::Random => choose_random_move_fast(&moves),
                 AIType::Smart => choose_smart_move_fast(&game, game.current_player(), &moves, roll),
                 AIType::MCTS => {
+                    if should_enable_reporting {
+                        display_search_header("MCTS", game.current_player(), roll, &moves);
+                    }
                     if let Some(piece_idx) = mcts_ai.choose_move(&game, game.current_player(), roll) {
                         piece_idx
                     } else {
                         choose_random_move_fast(&moves)
                     }
                 },
+                AIType::Minimax => {
+                    if should_enable_reporting {
+                        display_search_header("Minimax", game.current_player(), roll, &moves);
+                    }
+                    choose_minimax_move_parallel_with_config(&game, game.current_player(), &moves, roll, 3000, &minimax_config)
+                },
                 AIType::Human => unreachable!(),
             };
 
             // Print which piece it moved and to where
-            let ai_type = match current_player_type {
-                AIType::Random => "random AI",
-                AIType::Smart => "smart AI",
-                AIType::MCTS => "MCTS AI",
+            let ai_type_name = match current_player_type {
+                AIType::Random => "🎲 Random AI",
+                AIType::Smart => "🧠 Smart AI",
+                AIType::MCTS => "🤖 MCTS AI",
+                AIType::Minimax => "🎯 Minimax AI",
                 AIType::Human => unreachable!(),
             };
 
@@ -517,14 +623,14 @@ fn main() {
                         ""
                     };
                     println!("{} ({}) enters piece {} → path 0, grid ({}, {}){}",
-                            game.current_player().name(), ai_type, mv, r, c, extra_info);
+                            game.current_player().name(), ai_type_name, mv, r, c, extra_info);
                 }
                 1..=14 => {
                     let path_idx = pos - 1;
                     let new_path_idx = path_idx + roll;
                     if new_path_idx >= 14 {
                         println!("{} ({}) moves piece {} → EXIT",
-                                game.current_player().name(), ai_type, mv);
+                                game.current_player().name(), ai_type_name, mv);
                     } else {
                         let target_square = FastGameState::path_to_global(game.current_player(), new_path_idx);
                         let (r, c) = global_to_coord(target_square);
@@ -536,7 +642,7 @@ fn main() {
                             ""
                         };
                         println!("{} ({}) moves piece {} → path {}, grid ({}, {}){}",
-                                game.current_player().name(), ai_type, mv, new_path_idx, r, c, extra_info);
+                                game.current_player().name(), ai_type_name, mv, new_path_idx, r, c, extra_info);
                     }
                 }
                 _ => {}
