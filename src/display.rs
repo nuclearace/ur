@@ -307,7 +307,7 @@ pub fn display_search_complete(ai_name: &str, nodes: u64, time_ms: u64, nps: u64
         Print(format!("{}", format_number(nodes))),
         ResetColor
     );
-    let padding = 24 - format_number(nodes).len();
+    let padding = 24_usize.saturating_sub(format_number(nodes).len());
     for _ in 0..padding { print!(" "); }
     println!("│");
 
@@ -321,7 +321,7 @@ pub fn display_search_complete(ai_name: &str, nodes: u64, time_ms: u64, nps: u64
         ResetColor
     );
     let time_str = format!("{}ms", time_ms);
-    let padding = 25 - time_str.len();
+    let padding = 25_usize.saturating_sub(time_str.len());
     for _ in 0..padding { print!(" "); }
     println!("│");
 
@@ -335,7 +335,7 @@ pub fn display_search_complete(ai_name: &str, nodes: u64, time_ms: u64, nps: u64
         ResetColor
     );
     let nps_str = format!("{} nps", format_number(nps));
-    let padding = 24 - nps_str.len();
+    let padding = 24_usize.saturating_sub(nps_str.len());
     for _ in 0..padding { print!(" "); }
     println!("│");
 
@@ -350,7 +350,7 @@ pub fn display_search_complete(ai_name: &str, nodes: u64, time_ms: u64, nps: u64
             ResetColor
         );
         let best_str = format!("piece {} (score: {:.2})", mv, score);
-        let padding = 25 - best_str.len();
+        let padding = 25_usize.saturating_sub(best_str.len());
         for _ in 0..padding { print!(" "); }
         println!("│");
     }
@@ -373,7 +373,7 @@ pub fn display_search_header(ai_name: &str, player: FastPlayer, roll: u8, moves:
         Print(format!("🤖 {} Analyzing", ai_name)),
         ResetColor
     );
-    let padding = 21 - ai_name.len();
+    let padding = 21_usize.saturating_sub(ai_name.len());
     for _ in 0..padding { print!(" "); }
     println!("│");
 
@@ -393,7 +393,7 @@ pub fn display_search_header(ai_name: &str, player: FastPlayer, roll: u8, moves:
         ResetColor
     );
     let content_len = player.name().len() + 15; // Approximate content length
-    let padding = 35 - content_len;
+    let padding = 35_usize.saturating_sub(content_len);
     for _ in 0..padding { print!(" "); }
     println!("│");
     println!("└─────────────────────────────────────┘");

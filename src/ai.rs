@@ -45,7 +45,7 @@ impl MCTSAI {
         MCTSAI {
             simulations,
             exploration_constant,
-            max_simulation_depth: 200,
+            max_simulation_depth: 1024,
             num_threads: num_threads.max(1),
             enable_reporting: false,
             report_frequency: 1000,

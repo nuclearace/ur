@@ -596,7 +596,7 @@ fn main() {
                     if should_enable_reporting {
                         display_search_header("Minimax", game.current_player(), roll, &moves);
                     }
-                    choose_minimax_move_parallel_with_config(&game, game.current_player(), &moves, roll, 3000, &minimax_config)
+                    choose_minimax_move_parallel_with_config(&game, game.current_player(), &moves, roll, 5000, &minimax_config)
                 },
                 AIType::Human => unreachable!(),
             };
